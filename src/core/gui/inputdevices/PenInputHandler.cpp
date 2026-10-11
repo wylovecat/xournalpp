@@ -80,6 +80,16 @@ void PenInputHandler::handleScrollEvent(InputEvent const& event) {
     }
 }
 
+auto PenInputHandler::positionHitsSelectionHandle(InputEvent const& event) const -> bool {
+    EditSelection* selection = this->inputContext->getView()->getSelection();
+    if (!selection) {
+        return false;
+    }
+    PositionInputData pos = this->getInputDataRelativeToCurrentPage(selection->getView(), event);
+    return selection->getSelectionTypeForPos(pos.x, pos.y, this->inputContext->getView()->getZoom()) !=
+           CURSOR_SELECTION_NONE;
+}
+
 auto PenInputHandler::actionStart(InputEvent const& event) -> bool {
     this->inputContext->focusWidget();
 
@@ -100,7 +110,10 @@ auto PenInputHandler::actionStart(InputEvent const& event) -> bool {
     ToolHandler* toolHandler = this->inputContext->getToolHandler();
 
     // If the input starts outside a page, we make it act as hand tool instead.
-    if (currentPage == nullptr && toolHandler->pointActiveToolToToolType(TOOL_HAND)) {
+    // Clicks on the selection's handles (e.g. the delete button) must be honoured even when they are drawn
+    // outside of the page area (issue #7802)
+    if (currentPage == nullptr && !this->positionHitsSelectionHandle(event) &&
+        toolHandler->pointActiveToolToToolType(TOOL_HAND)) {
         this->inputStartedOutsidePageArea = true;
         toolHandler->fireToolChanged();
     }
