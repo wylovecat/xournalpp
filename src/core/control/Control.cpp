@@ -1019,10 +1019,26 @@ void Control::setViewPairedPages(bool enabled) {
 }
 
 void Control::setViewFullscreenMode(bool enabled) {
+    // Preserve the user's current visibility of menubar, toolbar and sidebar when toggling
+    // fullscreen, instead of resetting them to the view mode preset (issue #7811)
+    bool menubar = settings->isMenubarVisible();
+    bool toolbar = settings->isToolbarVisible();
+    bool sidebar = settings->isSidebarVisible();
+
     if (enabled) {
         this->loadViewMode(VIEW_MODE_FULLSCREEN);
     } else {
         this->loadViewMode(VIEW_MODE_DEFAULT);
+    }
+
+    if (settings->isMenubarVisible() != menubar) {
+        this->setShowMenubar(menubar);
+    }
+    if (settings->isToolbarVisible() != toolbar) {
+        this->setShowToolbar(toolbar);
+    }
+    if (settings->isSidebarVisible() != sidebar) {
+        this->setShowSidebar(sidebar);
     }
 }
 
