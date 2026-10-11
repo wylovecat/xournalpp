@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <sstream>  // for ostringstream
+#include <string>   // for string
+#include <unordered_set>
 #include <vector>   // for vector
 
 #include <qpdf/DLL.h>
@@ -80,6 +82,182 @@ static void reorderBackgrounds(QPDF& background, const std::vector<HybridPdfExpo
     xoj_assert(as_signed(background.getAllPages().size()) ==
                std::count_if(outputPageInfos.begin(), outputPageInfos.end(),
                              [](auto&& a) { return a.pdfBackgroundPageNumber != npos; }));
+}
+
+/*
+ * The QPDF writer keeps every object reachable from the document catalog. When
+ * pages have been removed from the page tree (partial export, duplicated or
+ * reordered pages), outline entries, link annotations and named destinations
+ * may still reference the removed pages, dragging their whole content (images,
+ * fonts, metadata, ...) into the exported file. The helpers below remove those
+ * dangling references so unexported pages are not retained.
+ */
+
+static std::string refKey(const QPDFObjectHandle& h) {
+    auto og = h.getObjGen();
+    return std::to_string(og.getObj()) + "," + std::to_string(og.getGen());
+}
+
+// Resolves the named destination against the catalog's /Dests dictionary.
+static QPDFObjectHandle resolveNamedDest(QPDF& pdf, const std::string& name) {
+    auto root = pdf.getRoot();
+    if (root.hasKey("/Dests")) {
+        auto dests = root.getKey("/Dests");
+        if (dests.isDictionary() && dests.hasKey(name)) {
+            auto dest = dests.getKey(name);
+            if (dest.isDictionary() && dest.hasKey("/D")) {
+                return dest.getKey("/D");
+            }
+            return dest;
+        }
+    }
+    return QPDFObjectHandle();
+}
+
+// Returns the page object a GoTo destination in an outline item or annotation points to, or null.
+static QPDFObjectHandle destinationPage(QPDF& pdf, const QPDFObjectHandle& dict) {
+    QPDFObjectHandle dest;
+    if (dict.hasKey("/Dest")) {
+        dest = dict.getKey("/Dest");
+    } else if (dict.hasKey("/A")) {
+        auto action = dict.getKey("/A");
+        if (action.isDictionary() && action.hasKey("/S") && action.getKey("/S").isName() &&
+            action.getKey("/S").getName() == "/GoTo" && action.hasKey("/D")) {
+            dest = action.getKey("/D");
+        }
+    }
+    if (dest.isName() || dest.isString()) {
+        dest = resolveNamedDest(pdf, dest.isName() ? dest.getName() : dest.getStringValue());
+    }
+    if (dest.isArray() && dest.getArrayNItems() > 0) {
+        auto page = dest.getArrayItem(0);
+        if (page.isPage()) {
+            return page;
+        }
+    }
+    return QPDFObjectHandle();
+}
+
+// Unlinks every outline item whose destination points to a removed page. Returns the number of
+// remaining descendants of parent (for the /Count entries).
+static int pruneOutlineItems(QPDF& pdf, QPDFObjectHandle& parent, const std::unordered_set<std::string>& kept) {
+    if (!parent.hasKey("/First")) {
+        return 0;
+    }
+    auto item = parent.getKey("/First");
+    QPDFObjectHandle prev;
+    int count = 0;
+    while (!item.isNull()) {
+        auto next = item.getKey("/Next");
+        int childCount = pruneOutlineItems(pdf, item, kept);
+        auto page = destinationPage(pdf, item);
+        bool drop = !page.isNull() && !kept.count(refKey(page));
+        if (drop) {
+            if (!prev.isNull()) {
+                if (next.isNull()) {
+                    prev.removeKey("/Next");
+                } else {
+                    prev.replaceKey("/Next", next);
+                }
+            } else {
+                if (next.isNull()) {
+                    parent.removeKey("/First");
+                } else {
+                    parent.replaceKey("/First", next);
+                }
+            }
+            if (!next.isNull()) {
+                if (prev.isNull()) {
+                    next.removeKey("/Prev");
+                } else {
+                    next.replaceKey("/Prev", prev);
+                }
+            }
+        } else {
+            count += 1 + childCount;
+            if (childCount > 0) {
+                item.replaceKey("/Count", QPDFObjectHandle::newInteger(childCount));
+            } else {
+                item.removeKey("/Count");
+            }
+            prev = item;
+        }
+        item = next;
+    }
+    if (prev.isNull()) {
+        parent.removeKey("/First");
+        parent.removeKey("/Last");
+    } else {
+        parent.replaceKey("/Last", prev);
+    }
+    return count;
+}
+
+static void pruneLinkAnnotations(QPDF& pdf, const std::unordered_set<std::string>& kept) {
+    for (auto&& page: QPDFPageDocumentHelper(pdf).getAllPages()) {
+        auto annots = page.getObjectHandle().getKey("/Annots");
+        if (!annots.isArray()) {
+            continue;
+        }
+        std::vector<QPDFObjectHandle> remaining;
+        int n = annots.getArrayNItems();
+        remaining.reserve(as_signed(n));
+        for (int i = 0; i < n; i++) {
+            auto annot = annots.getArrayItem(i);
+            auto pageDest = annot.isDictionary() ? destinationPage(pdf, annot) : QPDFObjectHandle();
+            if (!pageDest.isNull() && !kept.count(refKey(pageDest))) {
+                continue;
+            }
+            remaining.push_back(annot);
+        }
+        if (static_cast<int>(remaining.size()) != n) {
+            if (remaining.empty()) {
+                page.getObjectHandle().removeKey("/Annots");
+            } else {
+                page.getObjectHandle().replaceKey("/Annots", QPDFObjectHandle::newArray(remaining));
+            }
+        }
+    }
+}
+
+// Removes the entries of the catalog's /Dests dictionary whose target page has been removed.
+static void pruneDestsDictionary(QPDF& pdf, const std::unordered_set<std::string>& kept) {
+    auto root = pdf.getRoot();
+    if (!root.hasKey("/Dests")) {
+        return;
+    }
+    auto dests = root.getKey("/Dests");
+    if (!dests.isDictionary()) {
+        return;
+    }
+    for (auto&& [name, dest]: dests.getDictAsMap()) {
+        auto page = destinationPage(pdf, dest);
+        if (!page.isNull() && !kept.count(refKey(page))) {
+            dests.removeKey(name);
+        }
+    }
+}
+
+static void pruneDanglingDestinations(QPDF& background) {
+    std::unordered_set<std::string> kept;
+    kept.reserve(QPDFPageDocumentHelper(background).getAllPages().size());
+    for (auto&& p: QPDFPageDocumentHelper(background).getAllPages()) {
+        kept.insert(refKey(p.getObjectHandle()));
+    }
+
+    auto root = background.getRoot();
+    if (root.hasKey("/Outlines")) {
+        auto outlines = root.getKey("/Outlines");
+        if (outlines.isDictionary()) {
+            pruneOutlineItems(background, outlines, kept);
+            if (!outlines.hasKey("/First")) {
+                root.removeKey("/Outlines");
+            }
+        }
+    }
+
+    pruneLinkAnnotations(background, kept);
+    pruneDestsDictionary(background, kept);
 }
 
 bool QPdfExport::overlayAndSave(const fs::path& saveDestination, std::stringstream& overlaystream,
@@ -166,6 +344,9 @@ bool QPdfExport::overlayAndSave(const fs::path& saveDestination, std::stringstre
 
         replaceKey("/Producer", (std::string(PROJECT_STRING) + " + QPDF " + QPDF_VERSION));
         replaceKey("/ModDate", createPDFDateStringForNow());
+
+        // Don't let dangling destinations retain the content of unexported pages
+        pruneDanglingDestinations(background);
 
         QPDFWriter writer(background, char_cast(saveDestination.u8string().data()));  // is UTF8 ok?
         writer.write();
