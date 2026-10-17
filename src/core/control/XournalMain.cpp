@@ -37,6 +37,7 @@
 #include "undo/UndoRedoHandler.h"            // for UndoRedoHandler
 #include "util/PathUtil.h"                   // for getConfigFolder, openFil...
 #include "util/PlaceholderString.h"          // for PlaceholderString
+#include "util/StringUtils.h"                // for char_cast
 #include "util/Util.h"                       // for execInUiThread
 #include "util/VersionInfo.h"                // for getVersionInfo
 #include "util/XojMsgBox.h"                  // for XojMsgBox
@@ -426,6 +427,19 @@ void on_open_files(GApplication* application, gpointer f, gint numFiles, gchar* 
 void on_startup(GApplication* application, XMPtr app_data) {
     XournalMain::initLocalisation();
     ensure_input_model_compatibility();
+
+#ifdef _WIN32
+    // GTK3 resolves icon themes from XDG_DATA_DIRS plus the compile-time install prefix. Neither is
+    // usable on Windows: the prefix is wrong for a relocated or portable install, and a user-set
+    // XDG_DATA_DIRS hides the bundled themes entirely. GTK3 then cannot even find its own
+    // "image-missing" fallback and bails out with a hard assert in gtkiconhelper.c while the first
+    // toolbar is being realized, so the app dies without a window. Pin the bundled icon directory as
+    // a fallback search path. See https://github.com/xournalpp/xournalpp/issues/7133
+    if (const auto iconDir = Util::getDataPath().parent_path() / "icons"; fs::exists(iconDir)) {
+        gtk_icon_theme_append_search_path(gtk_icon_theme_get_default(), char_cast(iconDir.u8string().c_str()));
+    }
+#endif
+
     const MigrateResult migrateResult = migrateSettings();
 
     app_data->gladePath = std::make_unique<GladeSearchpath>();
