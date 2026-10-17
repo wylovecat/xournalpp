@@ -28,6 +28,12 @@ project(xournalpp
 # according to https://cmake.org/cmake/help/latest/command/project.html we must fix the suffix:
 # And https://gitlab.kitware.com/cmake/cmake/-/issues/16716 is still open:
 set(VERSION_SUFFIX "+dev")
+# Local build marker, appended after the suffix so self-built installers stay recognisable
+# in "Apps & features" and in the About dialog. Empty by default => identical to upstream.
+set(LOCAL_VERSION_SUFFIX "" CACHE STRING "Marker appended to the version string for local builds")
+if(LOCAL_VERSION_SUFFIX)
+    set(VERSION_SUFFIX "${VERSION_SUFFIX}-${LOCAL_VERSION_SUFFIX}")
+endif()
 set(PROJECT_VERSION "${PROJECT_VERSION}${VERSION_SUFFIX}")
 set(xournalpp_VERSION ${PROJECT_VERSION})
 set(CMAKE_PROJECT_VERSION ${PROJECT_VERSION})
