@@ -142,6 +142,15 @@ static std::u8string preprocessFormatString(std::u8string formatStr) {
     replace(u8"%T", u8"%H-%M-%S");
     replace(u8"%V", u8"%U");
 
+    // %c, %x and %X are locale-dependent, but the stream below always uses the classic C locale:
+    // mingw-w64 cannot set the system default locale (see XournalMain::initLocalisation), so they
+    // would yield US-style output ("10/17/26 11:45:07") whose separators the sanitizer at the bottom
+    // of this function then silently turns into underscores ("10_17_26 11_45_07"). Map them to the
+    // same ISO-shaped, filename-safe output as %F and %T so the documented examples hold.
+    replace(u8"%c", u8"%Y-%m-%d %H-%M-%S");
+    replace(u8"%x", u8"%Y-%m-%d");
+    replace(u8"%X", u8"%H-%M-%S");
+
     return formatStr;
 }
 
