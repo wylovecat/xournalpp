@@ -1,7 +1,7 @@
 --[[
   PagePngExport - Ctrl+E exports the current page as a PNG.
 
-  Fixed settings:
+  Fixed settings (normal Ctrl+E save dialog):
       format      PNG
       resolution  150 dpi
       range       current page only
@@ -12,26 +12,29 @@
         -> page exported -> empty top/bottom margins cut off.
 
   OI teaching bridge (shared mailbox with the VS Code teaching assistant):
-      - The assistant's "Export to class notes" writes the A4 PNGs to img/
-        and then writes their absolute paths to
+      - The assistant's "Export to class notes" writes tight, content-cropped
+        PNGs to img/ (not full A4) and then writes their absolute paths to
             %TEMP%\oi-assist-xournalpp\latest.txt
         (one path per line, '#' lines are comments).
-      - "Insert latest whiteboard image" (F8) reads that file and
-        appends the images as full A4 pages. The current page is reused when
-        it is empty; otherwise a page is inserted after it.
-      - On such a page, Ctrl+E does not open the save dialog. It writes the
-        annotated page straight back to the source PNG (150 dpi, background
-        none, no cropping) so the Typst note picks up the annotations.
+      - "Insert latest whiteboard image" (F8) reads that file and inserts
+        each image at the top of an A4 page (the blank below is for
+        annotations). The current page is reused when it is empty; otherwise a
+        page is inserted after it.
+      - On such a page, Ctrl+E does not open the save dialog. It temporarily
+        shortens the page to the bottom edge of the image + annotations,
+        exports the page back to the source PNG (background none, dpi taken
+        from the inserted image so 300 dpi stays 300 dpi), then restores the
+        page height. The Typst note therefore gets the
+        annotated image without a large blank top/bottom area.
         The write-back is only allowed while the page still contains the
         exact image element inserted by this plugin; if the image was removed,
         moved to another page, or the document was reloaded, the normal save
         dialog is used instead.
 
-  Cropping is done by trim.ps1, which ships with this plugin and uses
-  System.Drawing that comes with Windows. Width is preserved; only the
-  height shrinks. Set TRIM_ENABLED = false to keep full pages. Cropping is
-  intentionally skipped for the bridge write-back: the note image is A4 and
-  trimming would change its height in the note.
+  Cropping for the normal Ctrl+E (without a bridged image) is done by
+  trim.ps1, which ships with this plugin and uses System.Drawing that comes
+  with Windows. Width is preserved; only the height shrinks. Set
+  TRIM_ENABLED = false to keep full pages.
 
   Plugin folders (as used by this build):
       Windows: %LOCALAPPDATA%\xournalpp\plugins\PagePngExport\
@@ -381,14 +384,14 @@ end
 -- Export
 ----------------------------------------------------------------------
 
-local function exportCurrentPage(path, trim, quiet)
+local function exportCurrentPage(path, trim, quiet, dpi)
   local doc = app.getDocumentStructure()
 
   local ok, err = pcall(app.export, {
     outputFile = path,
     range = tostring(doc.currentPage),
     background = BACKGROUND,
-    pngDpi = DPI,
+    pngDpi = dpi or DPI,
   })
 
   if not ok then
@@ -410,11 +413,115 @@ local function exportCurrentPage(path, trim, quiet)
   return true
 end
 
+--- Bottom edge (pt) of all content on the current page: bridged image,
+--- annotations (strokes/text/images/links). Used to crop the A4 page before
+--- write-back so the Typst note does not get a large blank area.
+local function contentBottomOnCurrentPage()
+  local _, page = currentPageInfo()
+  if not page then
+    return nil
+  end
+
+  local bottom = 0
+  local function consider(y, h)
+    if type(y) == "number" and type(h) == "number" and h > 0 then
+      local b = y + h
+      if b > bottom then
+        bottom = b
+      end
+    end
+  end
+
+  local okStrokes, strokes = pcall(app.getStrokes, "page")
+  if okStrokes and type(strokes) == "table" then
+    for _, s in ipairs(strokes) do
+      local ys = s.y
+      local w = tonumber(s.width) or 0.5
+      if type(ys) == "table" then
+        for _, y in ipairs(ys) do
+          consider(y, w / 2)
+        end
+      end
+    end
+  end
+
+  local okTexts, texts = pcall(app.getTexts, "page")
+  if okTexts and type(texts) == "table" then
+    for _, t in ipairs(texts) do
+      consider(t.y, t.height)
+    end
+  end
+
+  local okImages, images = pcall(app.getImages, "page")
+  if okImages and type(images) == "table" then
+    for _, im in ipairs(images) do
+      consider(im.y, im.height)
+    end
+  end
+
+  local okLinks, links = pcall(app.getLinks, "page")
+  if okLinks and type(links) == "table" then
+    for _, l in ipairs(links) do
+      consider(l.y, l.height)
+    end
+  end
+
+  return bottom
+end
+
+--- Effective dpi of the bridged image: the extension may render at 150 or
+--- 300 dpi, and exporting the page at a fixed 150 would halve a 300 dpi note
+--- image. Returns nil when the image cannot be measured (fall back to DPI).
+local function bridgedImageDpi(entry)
+  local ok, images = pcall(app.getImages, "page")
+  if not ok or type(images) ~= "table" then
+    return nil
+  end
+  for _, image in ipairs(images) do
+    if image.ref == entry.ref then
+      local width = tonumber(image.width)
+      local pixels = tonumber(image.imageWidth)
+      if width and width > 0 and pixels and pixels > 0 then
+        local dpi = pixels / (width / 72)
+        if dpi >= 72 and dpi <= 1200 then
+          return math.floor(dpi + 0.5)
+        end
+      end
+      return nil
+    end
+  end
+  return nil
+end
+
 --- Writes the annotated current page back to the source PNG of a bridged page.
---- No cropping: the source is an A4 note image, and changing its height would
---- change the layout of the image in the Typst note.
+--- The note image is tight; this page is A4 with blank below it. Before export
+--- the page is temporarily shortened to the content bottom, then restored, so
+--- the source PNG has no large blank top/bottom area. The export dpi follows
+--- the inserted image, so a 300 dpi note stays at 300 dpi.
 local function writeBackBridgedPage(entry)
-  local ok, err = exportCurrentPage(entry.path, false, true)
+  local _, page = currentPageInfo()
+  if not page then
+    return false, "no current page"
+  end
+
+  local originalW, originalH = page.pageWidth, page.pageHeight
+  local bottom = contentBottomOnCurrentPage()
+  local margin = 10
+  local targetH = originalH
+  if type(bottom) == "number" and bottom > 0 then
+    targetH = math.min(originalH, bottom + margin)
+  end
+  local dpi = bridgedImageDpi(entry)
+
+  local shortened = targetH < originalH
+  if shortened then
+    app.setPageSize(originalW, targetH)
+  end
+  local ok, err = exportCurrentPage(entry.path, false, true, dpi)
+  if shortened then
+    app.setPageSize(originalW, originalH)
+  end
+
   if ok then
     log("write-back ok: " .. entry.path)
     toast("已回写：" .. baseName(entry.path))
@@ -524,9 +631,16 @@ function initUi()
     callback = "exportCurrentPagePngFull",
   })
   app.registerUi({
-    menu = "Insert latest whiteboard image (OI)",
+    menu = "Insert latest whiteboard image (OI) — F8",
     callback = "insertLatestWhiteboardImage",
     accelerator = INSERT_ACCELERATOR,
+  })
+  -- F8 is grabbed by some window managers (e.g. Cinnamon). Keep a portable
+  -- alternative on the same callback.
+  app.registerUi({
+    menu = "Insert latest whiteboard image (OI) — Ctrl+Alt+I",
+    callback = "insertLatestWhiteboardImage",
+    accelerator = "<Ctrl><Alt>i",
   })
   app.registerUi({
     menu = "Write back current whiteboard image (OI)",
