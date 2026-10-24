@@ -36,7 +36,12 @@ void drawPage(GtkPrintOperation* /*operation*/, GtkPrintContext* context, int pa
     double width = page->getWidth();
     double height = page->getHeight();
 
-    if (width > height) {
+    // requestPageSetup() below configures a landscape page for wide sheets, so the context is
+    // landscape as well - rotating on top of that lays the content on its side on a correctly
+    // sized sheet (https://github.com/xournalpp/xournalpp/issues/2969). Only rotate when the
+    // per-page setup did not make it through and we still got a portrait surface, which is the
+    // situation this block was originally written for.
+    if (width > height && gtk_print_context_get_width(context) < gtk_print_context_get_height(context)) {
         cairo_rotate(cr, M_PI_2);
         cairo_translate(cr, 0, -height);
     }
@@ -65,14 +70,17 @@ void requestPageSetup(GtkPrintOperation* /*op*/, GtkPrintContext* /*ctx*/, int p
 
     double width = page->getWidth();
     double height = page->getHeight();
+    const bool landscape = width > height;
 
-    if (width > height) {
-        gtk_page_setup_set_orientation(setup, GTK_PAGE_ORIENTATION_LANDSCAPE);
-    } else {
-        gtk_page_setup_set_orientation(setup, GTK_PAGE_ORIENTATION_PORTRAIT);
-    }
+    gtk_page_setup_set_orientation(setup, landscape ? GTK_PAGE_ORIENTATION_LANDSCAPE : GTK_PAGE_ORIENTATION_PORTRAIT);
 
-    GtkPaperSize* size = gtk_paper_size_new_custom("xoj-internal", "xoj-internal", width, height, GTK_UNIT_POINTS);
+    // A GtkPaperSize describes the physical sheet, and GtkPageSetup swaps its sides according to
+    // the orientation. Passing the page's own (width, height) for a wide page therefore asked for
+    // a portrait-shaped sheet (595x842 for a landscape A4), and drawPage()'s rotation then turned
+    // the content sideways on it (https://github.com/xournalpp/xournalpp/issues/2969). Hand over
+    // the sheet with its short edge as width and let the orientation do the swapping.
+    GtkPaperSize* size = gtk_paper_size_new_custom("xoj-internal", "xoj-internal", landscape ? height : width,
+                                                   landscape ? width : height, GTK_UNIT_POINTS);
     gtk_page_setup_set_paper_size(setup, size);
     gtk_paper_size_free(size);
 }
