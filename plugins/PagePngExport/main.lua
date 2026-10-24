@@ -12,24 +12,34 @@
         -> page exported -> empty top/bottom margins cut off.
 
   OI teaching bridge (shared mailbox with the VS Code teaching assistant):
-      - The assistant's "Export to class notes" writes tight, content-cropped
-        PNGs to img/ (not full A4) and then writes their absolute paths to
-            %TEMP%\oi-assist-xournalpp\latest.txt
-        (one path per line, '#' lines are comments).
-      - "Insert latest whiteboard image" (F8) reads that file and inserts
-        each image at the top of an A4 page (the blank below is for
-        annotations). The current page is reused when it is empty; otherwise a
-        page is inserted after it.
-      - On such a page, Ctrl+E does not open the save dialog. It temporarily
-        shortens the page to the bottom edge of the image + annotations,
-        exports the page back to the source PNG (background none, dpi taken
-        from the inserted image so 300 dpi stays 300 dpi), then restores the
-        page height. The Typst note therefore gets the
-        annotated image without a large blank top/bottom area.
-        The write-back is only allowed while the page still contains the
-        exact image element inserted by this plugin; if the image was removed,
-        moved to another page, or the document was reloaded, the normal save
-        dialog is used instead.
+
+  Lecture flow (current):
+      - Opening a problem board in VS Code creates the note placeholder and
+        appends one line to
+            %TEMP%\oi-assist-xournalpp\lecture-queue.txt
+        The queue is a UTF-8, tab-separated/escaped text file with a version
+        header. Its own path stays ASCII so Lua can open it on Chinese Windows
+        note folders; the paths inside may be Chinese.
+      - "Append queued problems to lecture" (F7, fallback Ctrl+Alt+L) reads
+        the queue for the currently open .xopp, appends one A4 page per
+        pending problem with the statement image at the top, and stores
+            OI:<id>:<seq>:<dpi>:<base>
+        in the page's <background name>. The extension watches the saved
+        .xopp and syncs the note image list from these tokens.
+      - Ctrl+E on a page with an OI token writes the page tight back to
+        <lecture dir>/img/<base>.png (or -p2.png for seq 2). It works after
+        restart and after pages are reordered because the token travels with
+        the page. The note .typ is updated by VS Code after Ctrl+S.
+      - A page without a token that follows a problem page can be bound as a
+        continuation: Ctrl+E asks once, writes -pN.png, and sets the token.
+
+  Legacy PNG bridge (still supported):
+      - The assistant's old "Export to class notes" writes tight PNGs to img/
+        and their absolute paths to %TEMP%\oi-assist-xournalpp\latest.txt.
+      - "Insert latest whiteboard image" (F8 / Ctrl+Alt+I) inserts each image
+        at the top of an A4 page. Ctrl+E then writes back through the in-memory
+        image reference; after a restart this legacy mapping is gone, so the
+        normal save dialog is used. New code should use the lecture flow.
 
   Cropping for the normal Ctrl+E (without a bridged image) is done by
   trim.ps1, which ships with this plugin and uses System.Drawing that comes
@@ -46,6 +56,12 @@ local DPI = 150
 local BACKGROUND = "none" -- "none" = transparent, "unruled" = white, "all" = paper
 local ACCELERATOR = "<Ctrl>e"
 local INSERT_ACCELERATOR = "F8"
+-- F9 is already "Show Toolbars" in Xournal++; F7 is free.
+local LECTURE_ACCELERATOR = "F7"
+local LECTURE_ACCELERATOR_ALT = "<Ctrl><Alt>l"
+local LECTURE_QUEUE_HEADER = "# oi-assist-lecture-queue v1"
+local A4_WIDTH = 595.275591
+local A4_HEIGHT = 841.889764
 
 local TRIM_ENABLED = true
 local TRIM_MARGIN = 10 -- pixels kept above/below the content at 150 dpi
@@ -121,7 +137,7 @@ end
 -- Shared mailbox (VS Code teaching assistant -> Xournal++)
 ----------------------------------------------------------------------
 
-local function mailboxPath()
+local function bridgeTempDir()
   local dir = os.getenv("TEMP") or os.getenv("TMP") or os.getenv("TMPDIR")
   if not dir or dir == "" then
     if package.config:sub(1, 1) == "/" then
@@ -132,7 +148,28 @@ local function mailboxPath()
   end
   dir = dir:gsub("[/\\]+$", "")
   local sep = package.config:sub(1, 1)
-  return dir .. sep .. "oi-assist-xournalpp" .. sep .. "latest.txt"
+  return dir .. sep .. "oi-assist-xournalpp"
+end
+
+local function mailboxPath()
+  local dir = bridgeTempDir()
+  if not dir then
+    return nil
+  end
+  local sep = package.config:sub(1, 1)
+  return dir .. sep .. "latest.txt"
+end
+
+--- Lecture queue lives in the system temp dir (ASCII path). Lua `io.open`
+--- on a Chinese Windows note directory is not reliable, so the extension
+--- writes this file here; paths inside it are still full UTF-8 strings.
+local function lectureQueuePath()
+  local dir = bridgeTempDir()
+  if not dir then
+    return nil
+  end
+  local sep = package.config:sub(1, 1)
+  return dir .. sep .. "lecture-queue.txt"
 end
 
 local function readMailbox()
@@ -153,6 +190,118 @@ local function readMailbox()
   end
   handle:close()
   return files
+end
+
+----------------------------------------------------------------------
+-- Lecture queue (VS Code -> Xournal++), tab-separated / escaped
+----------------------------------------------------------------------
+
+local function unescapeField(value)
+  local out = {}
+  local i = 1
+  while i <= #value do
+    local ch = value:sub(i, i)
+    if ch ~= "\\" then
+      out[#out + 1] = ch
+      i = i + 1
+    else
+      local n = value:sub(i + 1, i + 1)
+      if n == "\\" then
+        out[#out + 1] = "\\"
+      elseif n == "t" then
+        out[#out + 1] = "\t"
+      elseif n == "n" then
+        out[#out + 1] = "\n"
+      elseif n == "r" then
+        out[#out + 1] = "\r"
+      else
+        error("unknown escape")
+      end
+      i = i + 2
+    end
+  end
+  return table.concat(out)
+end
+
+local function splitTab(line)
+  local fields = {}
+  local pos = 1
+  while true do
+    local tab = line:find("\t", pos, true)
+    if not tab then
+      fields[#fields + 1] = line:sub(pos)
+      break
+    end
+    fields[#fields + 1] = line:sub(pos, tab - 1)
+    pos = tab + 1
+  end
+  return fields
+end
+
+local function normalizePath(value)
+  local out = (value or ""):gsub("\\", "/"):gsub("/+$", "")
+  if isWindows then
+    out = out:lower()
+  end
+  return out
+end
+
+local function samePath(a, b)
+  return normalizePath(a) == normalizePath(b)
+end
+
+--- Returns items, errors, queueFile. Missing queue file => items nil.
+local function readLectureQueue()
+  local file = lectureQueuePath()
+  if not file then
+    return nil, {"无法确定临时目录"}, nil
+  end
+  local handle = io.open(file, "rb")
+  if not handle then
+    return nil, {}, file
+  end
+  local items = {}
+  local errors = {}
+  local sawHeader = false
+  for rawLine in handle:lines() do
+    local line = rawLine:gsub("\r$", "")
+    if line == LECTURE_QUEUE_HEADER then
+      sawHeader = true
+    elseif line ~= "" and line:sub(1, 1) ~= "#" then
+      if not sawHeader then
+        errors[#errors + 1] = "queue line before header"
+      else
+        local fields = splitTab(line)
+        if #fields ~= 6 then
+          errors[#errors + 1] = "queue field count"
+        else
+          local ok, item = pcall(function()
+            return {
+              lecturePath = unescapeField(fields[1]),
+              id = unescapeField(fields[2]),
+              title = unescapeField(fields[3]),
+              assetPath = unescapeField(fields[4]),
+              base = unescapeField(fields[5]),
+              dpi = tonumber(unescapeField(fields[6])),
+            }
+          end)
+          if not ok then
+            errors[#errors + 1] = "queue escape"
+          elseif item.lecturePath == "" or item.id == "" or item.assetPath == ""
+                 or item.base == "" or not item.dpi then
+            errors[#errors + 1] = "queue required field"
+          else
+            items[#items + 1] = item
+          end
+        end
+      end
+    end
+  end
+  handle:close()
+  if not sawHeader then
+    errors[#errors + 1] = "queue header missing"
+  end
+  return items, errors, file
 end
 
 local function log(message)
@@ -225,12 +374,84 @@ local function pageHasContent()
   local okStrokes, strokes = pcall(app.getStrokes, "page")
   local okTexts, texts = pcall(app.getTexts, "page")
   local okImages, images = pcall(app.getImages, "page")
+  local okLinks, links = pcall(app.getLinks, "page")
   return (okStrokes and type(strokes) == "table" and #strokes > 0)
       or (okTexts and type(texts) == "table" and #texts > 0)
       or (okImages and type(images) == "table" and #images > 0)
+      or (okLinks and type(links) == "table" and #links > 0)
 end
 
 --- Inserts a new page after the current one and returns its number, or nil.
+----------------------------------------------------------------------
+-- Lecture page tokens: OI:<id>:<seq>:<dpi>:<base>
+----------------------------------------------------------------------
+
+local function tokenPart(value, fallback)
+  local out = (value or ""):gsub(":", "_"):gsub("^%s+", ""):gsub("%s+$", "")
+  if out == "" then
+    return fallback
+  end
+  return out
+end
+
+local function makeToken(id, seq, dpi, base)
+  return string.format("OI:%s:%d:%d:%s",
+    tokenPart(id, "题目"),
+    math.max(1, math.floor(tonumber(seq) or 1)),
+    math.max(72, math.min(600, math.floor((tonumber(dpi) or DPI) + 0.5))),
+    tokenPart(base, "板书"))
+end
+
+local function parseToken(name)
+  local id, seq, dpi, base = (name or ""):match("^OI:([^:]+):([1-9]%d*):(%d+):(.+)$")
+  if not id then
+    return nil
+  end
+  local n = tonumber(seq)
+  local d = tonumber(dpi)
+  if not n or not d or d < 72 or d > 600 or base == "" then
+    return nil
+  end
+  return { id = id, seq = n, dpi = math.floor(d + 0.5), base = base }
+end
+
+local function pageToken(page)
+  local layers = page and page.layers
+  local background = layers and layers[0]
+  local name = background and background.name or ""
+  return parseToken(name)
+end
+
+--- Current document + its directory, or nil when unsaved.
+local function lectureDocument()
+  local doc = app.getDocumentStructure()
+  local source = doc.xoppFilename or ""
+  if source == "" then
+    return nil, nil
+  end
+  local dir = splitPath(source)
+  return doc, dir
+end
+
+local function lectureNoteImagePath(dir, token, seq)
+  local n = seq or token.seq
+  local name = token.base .. (n == 1 and ".png" or ("-p" .. tostring(n) .. ".png"))
+  return dir .. "/img/" .. name
+end
+
+local function documentTokens(doc)
+  local byId = {}
+  local maxSeq = {}
+  for pageNo = 1, #doc.pages do
+    local token = pageToken(doc.pages[pageNo])
+    if token then
+      byId[token.id] = true
+      maxSeq[token.id] = math.max(maxSeq[token.id] or 0, token.seq)
+    end
+  end
+  return byId, maxSeq
+end
+
 local function addPageAfterCurrent()
   local before = currentPageInfo()
   if not before then
@@ -531,6 +752,287 @@ local function writeBackBridgedPage(entry)
   return false, err
 end
 
+----------------------------------------------------------------------
+-- Lecture: Ctrl+E writes the current page back to its note image
+----------------------------------------------------------------------
+
+local function lectureTargetOnCurrentPage()
+  local _, page = currentPageInfo()
+  if not page then
+    return nil
+  end
+  local token = pageToken(page)
+  if not token then
+    return nil
+  end
+  local _, dir = lectureDocument()
+  if not dir then
+    return nil
+  end
+  return {
+    notePath = lectureNoteImagePath(dir, token, token.seq),
+    dpi = token.dpi,
+    id = token.id,
+    seq = token.seq,
+    token = makeToken(token.id, token.seq, token.dpi, token.base),
+    continuation = false,
+  }
+end
+
+--- Page without a token: if it follows a problem page and has content,
+--- offer to bind it as the next continuation of that problem.
+local function continuationTarget()
+  local doc, dir = lectureDocument()
+  if not doc then
+    return nil
+  end
+  local currentNo = doc.currentPage
+  local _, page = currentPageInfo()
+  if not page or pageToken(page) or not pageHasContent() then
+    return nil
+  end
+
+  local owner = nil
+  for pageNo = currentNo - 1, 1, -1 do
+    local token = pageToken(doc.pages[pageNo])
+    if token then
+      owner = token
+      break
+    end
+  end
+  if not owner then
+    return nil
+  end
+  -- Refuse a page inserted in the middle of a problem block: the next token
+  -- with the same id means this page is not at the end, so we cannot guess seq.
+  for pageNo = currentNo + 1, #doc.pages do
+    local token = pageToken(doc.pages[pageNo])
+    if token and token.id == owner.id then
+      return nil
+    end
+  end
+
+  local _, maxSeq = documentTokens(doc)
+  local seq = (maxSeq[owner.id] or 0) + 1
+  return {
+    notePath = lectureNoteImagePath(dir, owner, seq),
+    dpi = owner.dpi,
+    id = owner.id,
+    seq = seq,
+    token = makeToken(owner.id, seq, owner.dpi, owner.base),
+    continuation = true,
+  }
+end
+
+--- Export the current page tight and atomically replace its note image.
+local function writeBackLecturePage(target)
+  local doc = app.getDocumentStructure()
+  local _, page = currentPageInfo()
+  if not page then
+    return false, "no current page"
+  end
+
+  local originalW, originalH = page.pageWidth, page.pageHeight
+  local bottom = contentBottomOnCurrentPage()
+  local targetH = originalH
+  if type(bottom) == "number" and bottom > 0 then
+    targetH = math.min(originalH, bottom + 10)
+  end
+  local shortened = targetH < originalH
+  if shortened then
+    app.setPageSize(originalW, targetH)
+  end
+
+  local temp = target.notePath .. ".tmp.png"
+  local ok, err = pcall(app.export, {
+    outputFile = temp,
+    range = tostring(doc.currentPage),
+    background = BACKGROUND,
+    pngDpi = target.dpi or DPI,
+  })
+  if shortened then
+    app.setPageSize(originalW, originalH)
+  end
+  if not ok then
+    log("lecture write-back export failed: " .. tostring(err))
+    return false, tostring(err)
+  end
+
+  local moved, moveErr = app.glib_rename(temp, target.notePath)
+  if not moved then
+    local ok2, renamed, err2 = pcall(os.rename, temp, target.notePath)
+    if not ok2 or not renamed then
+      log("lecture write-back rename failed: " .. tostring(moveErr) .. " / " .. tostring(err2))
+      return false, tostring(moveErr)
+    end
+  end
+
+  app.setBackgroundName(target.token)
+  local message = "已回写：" .. baseName(target.notePath) .. "（记得 Ctrl+S 保存整讲）"
+  toast(message)
+  log(message)
+  return true
+end
+
+local pendingContinuation = nil
+
+--- Callback for the "is this a continuation page?" dialog.
+function onContinuationChoice(choice)
+  local target = pendingContinuation
+  pendingContinuation = nil
+  if choice == 1 and target then
+    local ok, err = writeBackLecturePage(target)
+    if ok then
+      return
+    end
+    app.openDialog(
+      "续页没有回写成功：\n" .. tostring(err) .. "\n\n会用普通保存框代替。",
+      {"OK"}, "", true)
+  end
+  app.fileDialogSave("onFileChosen", suggestedName())
+end
+
+----------------------------------------------------------------------
+-- Lecture: append pending problem pages (F7)
+----------------------------------------------------------------------
+
+local function addPageAtEnd()
+  local before = #app.getDocumentStructure().pages
+  app.activateAction("new-page-at-end")
+  local after = app.getDocumentStructure()
+  if #after.pages <= before then
+    -- Older builds may not move to the new page; retry from the last page.
+    app.setCurrentPage(before)
+    app.activateAction("new-page-after")
+    after = app.getDocumentStructure()
+  end
+  if #after.pages <= before then
+    return nil
+  end
+  app.setCurrentPage(#after.pages)
+  return #after.pages
+end
+
+local function ensureLecturePage()
+  local _, page = currentPageInfo()
+  if not page then
+    return nil
+  end
+  if math.abs(page.pageWidth - A4_WIDTH) > 0.5 or math.abs(page.pageHeight - A4_HEIGHT) > 0.5 then
+    app.setPageSize(A4_WIDTH, A4_HEIGHT)
+  end
+  _, page = currentPageInfo()
+  if page and page.pageTypeFormat ~= "plain" then
+    app.changeCurrentPageBackground("plain")
+  end
+  return currentPageInfo()
+end
+
+--- F7: append every pending problem for the currently open lecture.
+function insertPendingLectureProblems()
+  local doc, dir = lectureDocument()
+  if not doc then
+    app.openDialog(
+      "当前文档还没有保存为 .xopp。\n\n请先保存成与课堂笔记同名的整讲文件（A.typ → A.xopp），再按 F7。",
+      {"OK"}, "", true)
+    return
+  end
+
+  local items, errors, queueFile = readLectureQueue()
+  if not items then
+    app.openDialog(
+      "找不到本节板书的交接队列。\n\n先在 VS Code 打开一道题的白板（会自动排队），并确认 Xournal++ 打开的是：\n" ..
+      tostring(doc.xoppFilename) .. "\n\n队列文件：\n" .. tostring(queueFile),
+      {"OK"}, "", true)
+    return
+  end
+
+  for _, item in ipairs(errors) do
+    log("lecture queue: " .. item)
+  end
+
+  local tokens = documentTokens(doc)
+  local seen = {}
+  local pending = {}
+  local otherLectures = {}
+  for _, item in ipairs(items) do
+    if samePath(item.lecturePath, doc.xoppFilename) then
+      if not tokens[item.id] and not seen[item.id] then
+        seen[item.id] = true
+        pending[#pending + 1] = item
+      end
+    elseif not otherLectures[item.lecturePath] then
+      otherLectures[item.lecturePath] = true
+    end
+  end
+
+  if #pending == 0 then
+    local extra = ""
+    local names = {}
+    for lecturePath in pairs(otherLectures) do
+      names[#names + 1] = lecturePath
+    end
+    if #names > 0 then
+      extra = "\n\n队列里还有其它整讲：\n" .. table.concat(names, "\n")
+    end
+    if #errors > 0 then
+      extra = extra .. "\n\n队列文件有 " .. #errors .. " 行无法解析，详见 bridge.log。"
+    end
+    app.openDialog(
+      "当前文档没有待插入的题目。\n\n本讲：\n" .. tostring(doc.xoppFilename) .. extra,
+      {"OK"}, "", true)
+    return
+  end
+
+  local reuseBlank = (#doc.pages == 1 and pageToken(doc.pages[1]) == nil and not pageHasContent())
+  local inserted = {}
+  local failed = {}
+
+  for _, item in ipairs(pending) do
+    local pageNo
+    if reuseBlank then
+      reuseBlank = false
+      pageNo = 1
+    else
+      pageNo = addPageAtEnd()
+    end
+    if not pageNo then
+      failed[#failed + 1] = item.id .. "\n无法新建页面"
+    else
+      ensureLecturePage()
+      local insertedPage, refOrError = insertImageOnCurrentPage(item.assetPath)
+      if insertedPage then
+        app.setBackgroundName(makeToken(item.id, 1, item.dpi, item.base))
+        inserted[#inserted + 1] = insertedPage
+        log(string.format("lecture: inserted %s on page %d", item.id, insertedPage))
+      else
+        failed[#failed + 1] = item.id .. "\n" .. tostring(refOrError)
+      end
+    end
+  end
+
+  if inserted[1] then
+    app.scrollToPage(inserted[1])
+  end
+  if #inserted > 0 then
+    local message = string.format("已插入 %d 道题。批注后按 Ctrl+E 回写；记得 Ctrl+S 保存整讲。", #inserted)
+    toast(message)
+    log(message)
+  end
+  if #failed > 0 or #errors > 0 then
+    local lines = {}
+    for _, item in ipairs(failed) do
+      lines[#lines + 1] = item
+    end
+    for _, item in ipairs(errors) do
+      lines[#lines + 1] = "队列：" .. item
+    end
+    app.openDialog(
+      "有 " .. (#failed + #errors) .. " 项没有插入：\n\n" .. table.concat(lines, "\n\n"),
+      {"OK"}, "", true)
+  end
+end
+
 --- Reads the shared mailbox and appends every image as a full page.
 function insertLatestWhiteboardImage()
   local files = readMailbox()
@@ -631,6 +1133,17 @@ function initUi()
     callback = "exportCurrentPagePngFull",
   })
   app.registerUi({
+    menu = "Append queued problems to lecture (OI) — F7",
+    callback = "insertPendingLectureProblems",
+    accelerator = LECTURE_ACCELERATOR,
+  })
+  -- F7 can be grabbed by window managers; keep a portable alternative.
+  app.registerUi({
+    menu = "Append queued problems to lecture (OI) — Ctrl+Alt+L",
+    callback = "insertPendingLectureProblems",
+    accelerator = LECTURE_ACCELERATOR_ALT,
+  })
+  app.registerUi({
     menu = "Insert latest whiteboard image (OI) — F8",
     callback = "insertLatestWhiteboardImage",
     accelerator = INSERT_ACCELERATOR,
@@ -650,6 +1163,24 @@ end
 
 --- Entry point behind Ctrl+E.
 function exportCurrentPagePng()
+  pendingContinuation = nil
+
+  -- 1) A page inserted by F7 carries OI:<id>:<seq>:<dpi>:<base>.
+  local lecture = lectureTargetOnCurrentPage()
+  if lecture then
+    local ok, err = writeBackLecturePage(lecture)
+    if ok then
+      return
+    end
+    app.openDialog(
+      "Could not write back to this note image:\n" .. lecture.notePath .. "\n\n" .. tostring(err) ..
+      "\n\nThe save dialog will open instead.",
+      {"OK"}, "", true)
+    app.fileDialogSave("onFileChosen", suggestedName())
+    return
+  end
+
+  -- 2) Legacy F8 bridge (the note PNG was inserted as an image page).
   local entry, reason = bridgedTargetOnCurrentPage()
   if entry then
     local ok, err = writeBackBridgedPage(entry)
@@ -665,6 +1196,20 @@ function exportCurrentPagePng()
       "More than one bridged whiteboard image is on this page.\n" ..
       "The save dialog will open instead.",
       {"OK"}, "", true)
+  end
+
+  -- 3) A manually added page after a problem page: offer to bind it as a continuation.
+  local continuation = continuationTarget()
+  if continuation then
+    pendingContinuation = continuation
+    app.openDialog(
+      string.format(
+        "本页没有绑定题目。\n\n把它作为 %s 的第 %d 页续页，回写到：\n%s\n\n之后记得 Ctrl+S 保存整讲。",
+        continuation.id, continuation.seq, continuation.notePath),
+      {"回写续页", "取消"},
+      "onContinuationChoice",
+      false)
+    return
   end
 
   app.fileDialogSave("onFileChosen", suggestedName())
