@@ -21,11 +21,14 @@
         header. Its own path stays ASCII so Lua can open it on Chinese Windows
         note folders; the paths inside may be Chinese.
       - "Append queued problems to lecture" (F7, fallback Ctrl+Alt+L) reads
-        the queue for the currently open .xopp, appends one A4 page per
-        pending problem with the statement image at the top, and stores
+        the queue for the currently open .xopp and appends one A4 page per
+        statement page, image at the top. A long statement may span several
+        pages: the optional 7th queue field is the page count N, slice i is
+        <base>.png for i = 1 and <base>-p<i>.png afterwards, and page i gets
+        slice i. Every page stores
             OI:<id>:<seq>:<dpi>:<base>
-        in the page's <background name>. The extension watches the saved
-        .xopp and syncs the note image list from these tokens.
+        with seq 1..N in its <background name>. The extension watches the
+        saved .xopp and syncs the note image list from these tokens.
       - Ctrl+E on a page with an OI token writes the page tight back to
         <lecture dir>/img/<base>.png (or -p2.png for seq 2). It works after
         restart and after pages are reordered because the token travels with
@@ -60,6 +63,10 @@ local INSERT_ACCELERATOR = "F8"
 local LECTURE_ACCELERATOR = "F7"
 local LECTURE_ACCELERATOR_ALT = "<Ctrl><Alt>l"
 local LECTURE_QUEUE_HEADER = "# oi-assist-lecture-queue v1"
+-- Upper bound for the optional page count in a queue line. The VS Code side
+-- (MAX_PAGES) enforces the same number; larger values are clamped here, not
+-- rejected, so one bad producer cannot flood a lecture with hundreds of pages.
+local MAX_PROBLEM_PAGES = 30
 local A4_WIDTH = 595.275591
 local A4_HEIGHT = 841.889764
 
@@ -131,6 +138,31 @@ end
 local function baseName(path)
   local _, name = splitPath(path)
   return name
+end
+
+--- Path of slice `index` for a multi-page statement asset. Must stay
+--- consistent with lectureNoteImagePath: the first slice is the asset itself,
+--- later slices get "-p<i>" before the extension
+--- (".../A0978.png" -> ".../A0978-p2.png").
+local function slicePath(assetPath, index)
+  if index <= 1 then
+    return assetPath
+  end
+  local dir, name = splitPath(assetPath)
+  local suffix = "-p" .. tostring(index)
+  -- "a.b.png" -> "a.b" + ".png"; a name without an extension gets no suffix
+  -- beyond "-p<i>" (the asset normally is a .png written by the extension).
+  local stemPart, ext = name:match("^(.-)(%.[^.]+)$")
+  local sliced
+  if stemPart then
+    sliced = stemPart .. suffix .. ext
+  else
+    sliced = name .. suffix
+  end
+  if dir == "" then
+    return sliced
+  end
+  return dir .. "/" .. sliced
 end
 
 ----------------------------------------------------------------------
@@ -272,10 +304,17 @@ local function readLectureQueue()
         errors[#errors + 1] = "queue line before header"
       else
         local fields = splitTab(line)
-        if #fields ~= 6 then
+        -- Field 7 (statement page count) is optional. A one-page problem is
+        -- still written with 6 fields, so short problems stay readable by an
+        -- older plugin and an old queue stays readable by this one.
+        if #fields ~= 6 and #fields ~= 7 then
           errors[#errors + 1] = "queue field count"
         else
           local ok, item = pcall(function()
+            local pages = 1
+            if #fields == 7 then
+              pages = tonumber(unescapeField(fields[7]))
+            end
             return {
               lecturePath = unescapeField(fields[1]),
               id = unescapeField(fields[2]),
@@ -283,6 +322,7 @@ local function readLectureQueue()
               assetPath = unescapeField(fields[4]),
               base = unescapeField(fields[5]),
               dpi = tonumber(unescapeField(fields[6])),
+              pages = pages,
             }
           end)
           if not ok then
@@ -290,7 +330,10 @@ local function readLectureQueue()
           elseif item.lecturePath == "" or item.id == "" or item.assetPath == ""
                  or item.base == "" or not item.dpi then
             errors[#errors + 1] = "queue required field"
+          elseif not item.pages or item.pages < 1 or item.pages % 1 ~= 0 then
+            errors[#errors + 1] = "queue page count"
           else
+            item.pages = math.floor(item.pages)
             items[#items + 1] = item
           end
         end
@@ -987,27 +1030,49 @@ function insertPendingLectureProblems()
   local reuseBlank = (#doc.pages == 1 and pageToken(doc.pages[1]) == nil and not pageHasContent())
   local inserted = {}
   local failed = {}
+  local insertedProblems = 0
 
   for _, item in ipairs(pending) do
-    local pageNo
-    if reuseBlank then
-      reuseBlank = false
-      pageNo = 1
-    else
-      pageNo = addPageAtEnd()
+    -- A long statement spans several A4 pages: page i gets slice i and the
+    -- token seq i, so Ctrl+E writes back to <base>.png / <base>-p<i>.png.
+    local requested = item.pages or 1
+    local pages = math.min(requested, MAX_PROBLEM_PAGES)
+    if pages < requested then
+      log(string.format("lecture: %s asks for %d pages, capped at %d",
+        item.id, requested, MAX_PROBLEM_PAGES))
     end
-    if not pageNo then
-      failed[#failed + 1] = item.id .. "\n无法新建页面"
-    else
-      ensureLecturePage()
-      local insertedPage, refOrError = insertImageOnCurrentPage(item.assetPath)
-      if insertedPage then
-        app.setBackgroundName(makeToken(item.id, 1, item.dpi, item.base))
-        inserted[#inserted + 1] = insertedPage
-        log(string.format("lecture: inserted %s on page %d", item.id, insertedPage))
+
+    local problemPages = 0
+    for index = 1, pages do
+      local pageNo
+      if reuseBlank then
+        -- Only the very first page of the whole run reuses an empty document
+        -- page; every other page (including later slices) is appended.
+        reuseBlank = false
+        pageNo = 1
       else
-        failed[#failed + 1] = item.id .. "\n" .. tostring(refOrError)
+        pageNo = addPageAtEnd()
       end
+      if not pageNo then
+        failed[#failed + 1] = item.id .. "\n第 " .. index .. "/" .. pages .. " 页：无法新建页面"
+        break
+      end
+      ensureLecturePage()
+      local insertedPage, refOrError = insertImageOnCurrentPage(slicePath(item.assetPath, index))
+      if not insertedPage then
+        -- Keep the pages that already landed; skip the remaining slices of
+        -- this problem only.
+        failed[#failed + 1] = item.id .. "\n第 " .. index .. "/" .. pages .. " 页：" .. tostring(refOrError)
+        break
+      end
+      app.setBackgroundName(makeToken(item.id, index, item.dpi, item.base))
+      inserted[#inserted + 1] = insertedPage
+      problemPages = problemPages + 1
+      log(string.format("lecture: inserted %s page %d/%d on page %d",
+        item.id, index, pages, insertedPage))
+    end
+    if problemPages > 0 then
+      insertedProblems = insertedProblems + 1
     end
   end
 
@@ -1015,7 +1080,12 @@ function insertPendingLectureProblems()
     app.scrollToPage(inserted[1])
   end
   if #inserted > 0 then
-    local message = string.format("已插入 %d 道题。批注后按 Ctrl+E 回写；记得 Ctrl+S 保存整讲。", #inserted)
+    -- Count problems, not pages: one long statement is still one problem.
+    local summary = string.format("%d 道题", insertedProblems)
+    if #inserted > insertedProblems then
+      summary = summary .. string.format("（共 %d 页）", #inserted)
+    end
+    local message = string.format("已插入 %s。批注后按 Ctrl+E 回写；记得 Ctrl+S 保存整讲。", summary)
     toast(message)
     log(message)
   end
