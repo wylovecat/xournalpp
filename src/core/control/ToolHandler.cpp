@@ -10,7 +10,7 @@
 #include <glib.h>  // for g_warning, g_error
 
 #include "control/Tool.h"  // for Tool, Tool::toolSizes
-#include "control/actions/ActionDatabase.h"
+#include "control/settings/ButtonConfig.h"
 #include "control/settings/Settings.h"  // for SElement, Settings
 #include "model/StrokeStyle.h"          // for StrokeStyle
 #include "model/TextAlignment.h"
@@ -25,8 +25,8 @@ class LineStyle;
 
 ToolListener::~ToolListener() = default;
 
-ToolHandler::ToolHandler(ToolListener* stateChangeListener, ActionDatabase* actionDB, Settings* settings):
-        stateChangeListener(stateChangeListener), actionDB(actionDB), settings(settings) {
+ToolHandler::ToolHandler(ToolListener* stateChangeListener, Settings* settings):
+        stateChangeListener(stateChangeListener), settings(settings) {
     initTools();
 }
 
@@ -157,21 +157,13 @@ ToolHandler::~ToolHandler() {
 void ToolHandler::setEraserType(EraserType eraserType) {
     Tool& tool = this->getTool(TOOL_ERASER);
     tool.setEraserType(eraserType);
-    eraserTypeChanged();
+    this->stateChangeListener->eraserTypeChanged();
 }
 
 void ToolHandler::setButtonEraserType(EraserType eraserType, Button button) {
     Tool* tool = getButtonTool(button);
     xoj_assert(tool);
     tool->setEraserType(eraserType);
-}
-
-void ToolHandler::eraserTypeChanged() {
-    if (this->actionDB == nullptr) {
-        return;
-    }
-
-    this->actionDB->setActionState(Action::TOOL_ERASER_TYPE, this->getEraserType());
 }
 
 auto ToolHandler::getEraserType() const -> EraserType {
@@ -430,7 +422,7 @@ void ToolHandler::setButtonStrokeType(const LineStyle& lineStyle, Button button)
 
 auto ToolHandler::getTools() const -> std::array<std::unique_ptr<Tool>, TOOL_COUNT> const& { return tools; }
 
-void ToolHandler::saveSettings() const {
+void ToolHandler::saveState() const {
     SElement& s = settings->getCustomElement("tools");
     s.clear();
 
@@ -506,7 +498,7 @@ void ToolHandler::saveSettings() const {
     settings->customSettingsChanged();
 }
 
-void ToolHandler::loadSettings() {
+void ToolHandler::loadState() {
     SElement& s = settings->getCustomElement("tools");
 
     std::string selectedTool;
@@ -564,13 +556,12 @@ void ToolHandler::loadSettings() {
 
                 if (st.getString("type", type)) {
                     if (type == "deleteStroke") {
-                        setEraserType(ERASER_TYPE_DELETE_STROKE);
+                        tool->setEraserType(ERASER_TYPE_DELETE_STROKE);
                     } else if (type == "whiteout") {
-                        setEraserType(ERASER_TYPE_WHITEOUT);
+                        tool->setEraserType(ERASER_TYPE_WHITEOUT);
                     } else {
-                        setEraserType(ERASER_TYPE_DEFAULT);
+                        tool->setEraserType(ERASER_TYPE_DEFAULT);
                     }
-                    eraserTypeChanged();
                 }
             }
 
@@ -586,6 +577,17 @@ void ToolHandler::loadSettings() {
                 tool->setTextJustify(justify);
             }
         }
+    }
+}
+
+void ToolHandler::loadButtonSettings() {
+    std::vector<Button> buttons{Button::BUTTON_ERASER,     Button::BUTTON_STYLUS_ONE,   Button::BUTTON_STYLUS_TWO,
+                                Button::BUTTON_MOUSE_LEFT, Button::BUTTON_MOUSE_MIDDLE, Button::BUTTON_MOUSE_RIGHT,
+                                Button::BUTTON_MOUSE_4,    Button::BUTTON_MOUSE_5,      Button::BUTTON_TOUCH};
+    ButtonConfig* cfg;
+    for (auto b: buttons) {
+        cfg = settings->getButtonConfig(b);
+        cfg->initButton(this, b);
     }
 }
 

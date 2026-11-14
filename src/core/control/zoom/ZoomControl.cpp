@@ -92,7 +92,7 @@ void ZoomControl::zoomOneStep(ZoomDirection direction, xoj::util::Point<double> 
     }
     this->setZoomFitMode(false);
 
-    double newZoom = this->withZoomStep(direction, this->zoomStep);
+    double newZoom = this->withZoomStep(direction, this->control->getSettings()->getZoomStep() / 100.);
 
     startZoomSequence(zoomCenter);
     this->zoomSequenceChange(newZoom, false);
@@ -114,7 +114,7 @@ void ZoomControl::zoomScroll(ZoomDirection direction, xoj::util::Point<double> z
         this->setZoomFitMode(false);
     }
 
-    double newZoom = this->withZoomStep(direction, this->zoomStepScroll);
+    double newZoom = this->withZoomStep(direction, this->control->getSettings()->getZoomStepScroll() / 100.);
     startZoomSequence(zoomCenter);
     this->zoomSequenceChange(newZoom, false);
     endZoomSequence();
@@ -266,6 +266,9 @@ void ZoomControl::setZoom100Value(double zoom100Val) {
         g_warning("Ignoring invalid zoom100Value: %f", zoom100Val);
         return;
     }
+    // zoom100Value = DPI / Util::DPI_NORMALIZATION_FACTOR, so these bounds mirror the [36, 720] DPI range the
+    // automatic detection clamps to in xoj::util::gtk::getWidgetDPI() (36 / 72 = 0.5, 720 / 72 = 10.0). They also
+    // contain the manual calibration slider's range [50, 400] DPI (see the adjustmentZoom in settings.glade).
     zoom100Val = std::clamp(zoom100Val, 0.5, 10.0);
     auto setWithRelZoom = [zoomOld = this->zoom100Value, zoom100Val](double& val) { val = val / zoomOld * zoom100Val; };
     setWithRelZoom(this->zoomMax);
@@ -387,10 +390,6 @@ void ZoomControl::setZoomPresentationMode(bool isZoomPresentationMode) {
 }
 
 auto ZoomControl::isZoomPresentationMode() const -> bool { return this->zoomPresentationMode; }
-
-void ZoomControl::setZoomStep(double zoomStep) { this->zoomStep = zoomStep; }
-
-void ZoomControl::setZoomStepScroll(double zoomStep) { this->zoomStepScroll = zoomStep; }
 
 void ZoomControl::pageSizeChanged(size_t page) {
     updateZoomPresentationValue(page);
