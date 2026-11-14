@@ -994,13 +994,19 @@ function insertPendingLectureProblems()
     log("lecture queue: " .. item)
   end
 
-  local tokens = documentTokens(doc)
+  -- 0.5: a multi-page problem that was inserted only partly stays pending.
+  -- `documentTokens` also returns the highest seq per id; treat an item as
+  -- done only when all its slices are in. (0.4 skipped any item that had a
+  -- token, so slices 2..N could never be filled in after a mid-way failure.)
+  local _, maxSeq = documentTokens(doc)
   local seen = {}
   local pending = {}
   local otherLectures = {}
   for _, item in ipairs(items) do
     if samePath(item.lecturePath, doc.xoppFilename) then
-      if not tokens[item.id] and not seen[item.id] then
+      local wanted = math.min(item.pages or 1, MAX_PROBLEM_PAGES)
+      local insertedAlready = maxSeq[item.id] or 0
+      if insertedAlready < wanted and not seen[item.id] then
         seen[item.id] = true
         pending[#pending + 1] = item
       end
@@ -1042,10 +1048,12 @@ function insertPendingLectureProblems()
         item.id, requested, MAX_PROBLEM_PAGES))
     end
 
+    -- 0.5: resume from the first missing slice instead of re-inserting page 1.
+    local startIndex = math.max(1, (maxSeq[item.id] or 0) + 1)
     local problemPages = 0
-    for index = 1, pages do
+    for index = startIndex, pages do
       local pageNo
-      if reuseBlank then
+      if reuseBlank and index == 1 then
         -- Only the very first page of the whole run reuses an empty document
         -- page; every other page (including later slices) is appended.
         reuseBlank = false
