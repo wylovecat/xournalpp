@@ -69,7 +69,6 @@ class ZoomControl;
 class ToolMenuHandler;
 class XojFont;
 class XojPdfRectangle;
-class Callback;
 class ActionDatabase;
 class NavigationHistory;
 
@@ -80,14 +79,14 @@ class Control:
         public ClipboardListener,
         public ProgressListener {
 public:
-    Control(GApplication* gtkApp, GladeSearchpath* gladeSearchPath, bool disableAudio);
+    Control(GApplication* gtkApp, GladeSearchpath* gladeSearchPath);
     Control(Control const&) = delete;
     Control(Control&&) = delete;
     auto operator=(Control const&) -> Control& = delete;
     auto operator=(Control&&) -> Control& = delete;
     ~Control() override;
 
-    void initWindow(MainWindow* win);
+    void initWindow(MainWindow* win, bool disableAudio);
 
 public:
     /// Asymchronously closes the current document and replaces it by a new file
@@ -167,6 +166,7 @@ public:
     void toolSizeChanged() override;
     void toolFillChanged() override;
     void toolLineStyleChanged() override;
+    void eraserTypeChanged() override;
 
     void selectTool(ToolType type);
     void selectDefaultTool();
@@ -303,7 +303,6 @@ public:
     void addChangedDocumentListener(DocumentListener* dl);
     void removeChangedDocumentListener(DocumentListener* dl);
 
-    MetadataManager* getMetadataManager() const;
     Settings* getSettings() const;
     ToolHandler* getToolHandler() const;
     ZoomControl* getZoomControl() const;
@@ -338,12 +337,6 @@ public:
     void help();
 
     void selectAlpha(OpacityFeature feature);
-
-    /**
-     * @brief Initialize the all button tools based on the respective ButtonConfigs
-     *
-     */
-    void initButtonTool();
 
 
 public:

@@ -21,9 +21,9 @@
 #include "gui/toolbarMenubar/model/ColorPalette.h"  // for Palette
 #include "model/FormatDefinitions.h"                // for FormatUnits, XOJ_...
 #include "util/Color.h"
-#include "util/PathUtil.h"  // for getConfigFile
-#include "util/Util.h"      // for PRECISION_FORMAT_...
-#include "util/i18n.h"      // for _
+#include "util/PathUtil.h"    // for getConfigFile
+#include "util/Util.h"        // for PRECISION_FORMAT_...
+#include "util/i18n.h"        // for _
 #include "util/safe_casts.h"  // for as_unsigned
 #include "util/utf8_view.h"   // for utf8_view
 
@@ -39,6 +39,12 @@ constexpr auto const* DEFAULT_FONT = "Sans";
 constexpr auto DEFAULT_FONT_SIZE = 12;
 constexpr auto DEFAULT_TOOLBAR = "Portrait";
 
+/// Zoomstep value for Ctrl - and Zoom In and Out Button. Effect depends on dpi (REAL_PERCENTAGE_VALUE * zoom100Value)
+constexpr auto DEFAULT_ZOOM_STEP{10.};
+
+/// Zoomstep value for Ctrl-Scroll zooming. Effect depends on dpi (REAL_PERCENTAGE_VALUE * zoom100Value)
+constexpr auto DEFAULT_ZOOM_STEP_SCROLL{1.};
+
 #define SAVE_BOOL_PROP(var) xmlNode = saveProperty((const char*)#var, (var) ? "true" : "false", root)
 #define SAVE_STRING_PROP(var) xmlNode = saveProperty((const char*)#var, (var).empty() ? "" : (var).data(), root)
 #define SAVE_FONT_PROP(var) xmlNode = saveProperty((const char*)#var, var.asString().c_str(), root)
@@ -49,7 +55,11 @@ constexpr auto DEFAULT_TOOLBAR = "Portrait";
     com = xmlNewComment((const xmlChar*)(var)); \
     xmlAddPrevSibling(xmlNode, com);
 
-Settings::Settings(fs::path filepath): filepath(std::move(filepath)) { loadDefault(); }
+Settings::Settings(fs::path savePath): savePath(std::move(savePath)), loadPath(this->savePath) { loadDefault(); }
+
+Settings::Settings(fs::path savePath, fs::path loadPath): savePath(std::move(savePath)), loadPath(std::move(loadPath)) {
+    loadDefault();
+}
 
 Settings::~Settings() = default;
 
@@ -80,8 +90,8 @@ void Settings::loadDefault() {
     this->edgePanSpeed = 20.0;
     this->edgePanMaxMult = 5.0;
 
-    this->zoomStep = 10.0;
-    this->zoomStepScroll = 2.0;
+    this->zoomStep = DEFAULT_ZOOM_STEP;
+    this->zoomStepScroll = DEFAULT_ZOOM_STEP_SCROLL;
 
     this->displayDpi = -1;  // Automatic detection
 
@@ -434,7 +444,14 @@ void Settings::parseItem(xmlDocPtr doc, xmlNodePtr cur) {
     } else if (xmlStrcmp(name, reinterpret_cast<const xmlChar*>("forceZoomToFitOnLoad")) == 0) {
         this->forceZoomToFitOnLoad = xmlStrcmp(value, reinterpret_cast<const xmlChar*>("true")) == 0;
     } else if (xmlStrcmp(name, reinterpret_cast<const xmlChar*>("displayDpi")) == 0) {
-        this->displayDpi = g_ascii_strtoll(reinterpret_cast<const char*>(value), nullptr, 10);
+        int dpi = static_cast<int>(g_ascii_strtoll(reinterpret_cast<const char*>(value), nullptr, 10));
+        // -1 means automatic detection; anything else must be within the calibration slider's range
+        // (0 or negative values would break pasting/scaling, see https://github.com/xournalpp/xournalpp/issues/6720)
+        if (dpi != -1 && (dpi < 50 || dpi > 400)) {
+            g_warning("Settings::Invalid displayDpi value \"%s\". Reset to automatic detection.", value);
+            dpi = -1;
+        }
+        this->displayDpi = dpi;
     } else if (xmlStrcmp(name, reinterpret_cast<const xmlChar*>("mainWndWidth")) == 0) {
         this->mainWndWidth = g_ascii_strtoll(reinterpret_cast<const char*>(value), nullptr, 10);
     } else if (xmlStrcmp(name, reinterpret_cast<const xmlChar*>("mainWndHeight")) == 0) {
@@ -836,12 +853,12 @@ void Settings::loadButtonConfig() {
 auto Settings::load() -> bool {
     xmlKeepBlanksDefault(0);
 
-    if (!fs::exists(filepath)) {
-        g_warning("Settings file %s does not exist. Regenerating. ", filepath.string().c_str());
+    if (!fs::exists(loadPath)) {
+        g_warning("Settings file %s does not exist. Regenerating. ", loadPath.string().c_str());
         save();
     }
 
-    xmlDocPtr doc = xmlParseFile(char_cast(filepath.u8string().c_str()));
+    xmlDocPtr doc = xmlParseFile(char_cast(loadPath.u8string().c_str()));
 
     if (doc == nullptr) {
         g_warning("Settings::load:: doc == null, could not load Settings!\n");
@@ -850,14 +867,14 @@ auto Settings::load() -> bool {
 
     xmlNodePtr cur = xmlDocGetRootElement(doc);
     if (cur == nullptr) {
-        g_message("The settings file \"%s\" is empty", filepath.string().c_str());
+        g_message("The settings file \"%s\" is empty", loadPath.string().c_str());
         xmlFreeDoc(doc);
 
         return false;
     }
 
     if (xmlStrcmp(cur->name, reinterpret_cast<const xmlChar*>("settings"))) {
-        g_message("File \"%s\" is of the wrong type", filepath.string().c_str());
+        g_message("File \"%s\" is of the wrong type", loadPath.string().c_str());
         xmlFreeDoc(doc);
 
         return false;
@@ -1253,7 +1270,7 @@ void Settings::save() {
         saveData(root, p.first, p.second);
     }
 
-    xmlSaveFormatFileEnc(char_cast(filepath.u8string().c_str()), doc, "UTF-8", true);
+    xmlSaveFormatFileEnc(char_cast(savePath.u8string().c_str()), doc, "UTF-8", true);
     xmlFreeDoc(doc);
 }
 

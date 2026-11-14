@@ -93,12 +93,6 @@ public:
 
 protected:
     /**
-     * @return true if the event's position hits one of the active selection's handles (which may be drawn
-     * outside of the page area, see issue #7802)
-     */
-    bool positionHitsSelectionHandle(InputEvent const& event) const;
-
-    /**
      * Action for the start of an input
      * @param event The event triggering the action
      */
